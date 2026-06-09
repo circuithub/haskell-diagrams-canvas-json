@@ -105,54 +105,96 @@ interface CustomLayerState {
 type LayerState = CommandLayerState | MaskLayerState | CustomLayerState;
 
 /**
- * Check if commands contain a GCO destination-in and split at the boundary.
- * Returns { content, clip } where clip is the commands inside the destination-in group.
- * If no destination-in, clip is empty.
+ * Split commands at a GCO destination-in boundary for PixiJS masking.
+ *
+ * PixiJS has no blend-mode equivalent of Canvas 2D's `destination-in`, so
+ * the viewer extracts the clip geometry into a separate texture and applies
+ * it as a Sprite alpha-mask.
+ *
+ * The Haskell backend guarantees:
+ *  - At most one `GCO destination-in` per layer.
+ *  - It is always inside a dedicated S/R group (no drawing before the GCO).
+ *  - Only `destination-out` operations follow the group (no source-over
+ *    content that would need to escape the clip).
+ *
+ * Commands after the dest-in group are placed in `content` and are therefore
+ * subject to the clip mask.  This is correct because Canvas 2D
+ * `(content ∩ clip) \ holes` equals PixiJS `(content \ holes) ∩ clip` when
+ * only dest-out (erase) follows the clip.  Violations of these invariants
+ * throw so that problems surface immediately rather than producing subtly
+ * wrong visuals.
+ *
+ * Algorithm: find the GCO, then walk backward/forward to locate its
+ * enclosing S/R group, skipping nested S/R pairs via depth tracking.
  */
 function splitAtDestinationIn(commands: CanvasCommand[]): {
   content: CanvasCommand[];
   clip: CanvasCommand[];
 } {
-  // Find the S/R group that starts with GCO destination-in.
-  // Pattern: S, GCO destination-in, ...shapes..., R
-  let clipStart = -1;
-  let clipEnd = -1;
-  let depth = 0;
-  let clipStartDepth = -1;
-
+  // 1. Find the GCO destination-in command (assert at most one).
+  let gcoIdx = -1;
   for (let i = 0; i < commands.length; i++) {
-    const cmd = commands[i];
-    if (cmd[0] === "S") {
-      if (
-        clipStart < 0 &&
-        i + 1 < commands.length &&
-        commands[i + 1][0] === "GCO" &&
-        commands[i + 1][1] === "destination-in"
-      ) {
-        clipStart = i;
-        clipStartDepth = depth;
+    if (commands[i][0] === "GCO" && commands[i][1] === "destination-in") {
+      if (gcoIdx >= 0) {
+        throw new Error(
+          "splitAtDestinationIn: multiple GCO destination-in commands " +
+            `(indices ${gcoIdx} and ${i}). Only one per layer is supported.`,
+        );
       }
-      depth++;
-    } else if (cmd[0] === "R") {
-      depth--;
-      if (clipStart >= 0 && clipEnd < 0 && depth === clipStartDepth) {
-        clipEnd = i;
+      gcoIdx = i;
+    }
+  }
+  if (gcoIdx < 0) return { content: commands, clip: [] };
+
+  // 2. Walk backward from the GCO to find the enclosing Save.
+  //    depth starts at 1 (we are inside one S); R increments (entering a
+  //    closed group going backward), S decrements; 0 means we found our S.
+  let groupStart = -1;
+  for (let d = 1, j = gcoIdx - 1; j >= 0; j--) {
+    if (commands[j][0] === "R") d++;
+    else if (commands[j][0] === "S") {
+      if (--d === 0) {
+        groupStart = j;
+        break;
       }
     }
   }
-
-  if (clipStart < 0 || clipEnd < 0) {
-    return { content: commands, clip: [] };
+  if (groupStart < 0) {
+    throw new Error(
+      "splitAtDestinationIn: GCO destination-in at index " +
+        `${gcoIdx} has no enclosing Save.`,
+    );
   }
 
-  // Content: everything except the clip group
-  const content = [
-    ...commands.slice(0, clipStart),
-    ...commands.slice(clipEnd + 1),
-  ];
-  // Clip: the shapes inside the clip group (skip S, GCO destination-in at start, and R at end)
-  const clip = commands.slice(clipStart + 2, clipEnd);
+  // 3. Walk forward from the GCO to find the matching Restore.
+  //    depth starts at 1; S increments, R decrements; 0 means we found our R.
+  let groupEnd = -1;
+  for (let d = 1, j = gcoIdx + 1; j < commands.length; j++) {
+    if (commands[j][0] === "S") d++;
+    else if (commands[j][0] === "R") {
+      if (--d === 0) {
+        groupEnd = j;
+        break;
+      }
+    }
+  }
+  if (groupEnd < 0) {
+    throw new Error(
+      "splitAtDestinationIn: GCO destination-in at index " +
+        `${gcoIdx} (Save at ${groupStart}) has no matching Restore.`,
+    );
+  }
 
+  // 4. Content = everything outside [groupStart..groupEnd].
+  //    Clip = commands between S and GCO (state setup, e.g. FS for `f` fills)
+  //         + commands between GCO and R (clip geometry).
+  //    Use slice + concat (not spread) to avoid stack overflow on large arrays.
+  const content = commands
+    .slice(0, groupStart)
+    .concat(commands.slice(groupEnd + 1));
+  const clip = commands
+    .slice(groupStart + 1, gcoIdx)
+    .concat(commands.slice(gcoIdx + 1, groupEnd));
   return { content, clip };
 }
 
