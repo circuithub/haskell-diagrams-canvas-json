@@ -276,17 +276,34 @@ function buildCustomLayerState(
   return { kind: "custom", canvas, sprite, render };
 }
 
+/**
+ * Destroy a RenderTexture without letting its death notify shared PixiJS state.
+ *
+ * See Note [Viewer teardown is page-local].
+ */
+function destroyRenderTexture(texture: RenderTexture): void {
+  const source = texture.source;
+  source.style?.removeAllListeners();
+  source.removeAllListeners();
+  texture.destroy(true);
+}
+
 function destroyLayerState(state: LayerState, destroyTextures = false): void {
   if (state.kind === "command") {
     state.scene.destroy({ children: true });
-    state.renderTexture.destroy(destroyTextures);
+    if (destroyTextures) destroyRenderTexture(state.renderTexture);
+    else state.renderTexture.destroy(false);
     state.sprite.destroy();
   } else if (state.kind === "mask") {
     state.scene.destroy({ children: true });
-    state.renderTexture.destroy(destroyTextures);
+    if (destroyTextures) destroyRenderTexture(state.renderTexture);
+    else state.renderTexture.destroy(false);
     state.sprite.destroy();
     if (state.clipScene) state.clipScene.destroy({ children: true });
-    if (state.clipTexture) state.clipTexture.destroy(destroyTextures);
+    if (state.clipTexture) {
+      if (destroyTextures) destroyRenderTexture(state.clipTexture);
+      else state.clipTexture.destroy(false);
+    }
     if (state.clipSprite) state.clipSprite.destroy();
   } else {
     state.sprite.destroy();
@@ -571,7 +588,16 @@ export async function createPixiViewer(
         destroyLayerState(ls, true);
       }
       layerStates = [];
-      app.destroy(true);
+      // Remove the canvas, but do NOT pass `true` / `releaseGlobalResources`.
+      // That flag makes PixiJS run GlobalResourceRegistry.release(), which
+      // clears the PAGE-GLOBAL TexturePool and destroys every pooled texture —
+      // including ones another live viewer's FilterSystem is still holding.
+      // Those destroyed TextureSources emit "change", and the surviving
+      // FilterSystem's BindGroup nulls its own `resources` in response, so its
+      // next filtered render throws. A page can host several viewers at once
+      // (e.g. a board preview opened over the viewer tab), so tearing one down
+      // must not touch shared state. See Note [Viewer teardown is page-local].
+      app.destroy({ removeView: true });
     },
 
     setLayers(newLayers: ViewerLayer[]): void {
@@ -606,3 +632,34 @@ export async function createPixiViewer(
     },
   };
 }
+
+// Note [Viewer teardown is page-local]
+//
+// A page can host more than one viewer at a time -- the project detail viewer
+// tab keeps its viewer mounted while the order flow opens a second board
+// preview on top of it. PixiJS shares mutable state between every Application
+// on the page, so destroying one viewer must not disturb the others.
+//
+// Two pieces of shared state bite here, and both surface as
+// `TypeError: Cannot read properties of null (reading '<n>')` thrown from the
+// surviving viewer's next render:
+//
+//  1. TexturePool. FilterSystem draws its working textures from this global
+//     pool. `app.destroy(true)` (or `{ releaseGlobalResources: true }`) runs
+//     GlobalResourceRegistry.release(), which clears the pool and destroys
+//     every texture in it -- including ones another live viewer's
+//     FilterSystem still has bound. So we destroy with `{ removeView: true }`,
+//     which drops our canvas and leaves shared pools alone.
+//
+//  2. BigPool. AlphaMaskPipe borrows its AlphaMaskEffect (and with it a single
+//     MaskFilter and that filter's BindGroup) from this global pool, so the
+//     same BindGroup is reused by every Application. MaskFilter.apply() binds
+//     whichever mask texture rendered most recently, which may be ours.
+//
+// A BindGroup permanently nulls its own `resources` when a bound resource is
+// destroyed (BindGroup.onResourceChange -> destroy), and nothing ever repairs
+// it -- so poisoning a *shared* BindGroup breaks every viewer that later
+// borrows it. Our layer RenderTextures are private to this viewer and are
+// about to go away, so we drop their listeners before destroying them: the
+// "change" event that would poison a shared BindGroup is simply never
+// delivered. GPU memory is still freed.
