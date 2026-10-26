@@ -21,7 +21,7 @@ executable diagrams-canvas-json-viewer
   import:           warnings
   main-is:          Main.hs
   build-depends:
-    , base                  ^>=4.20.2.0
+    , base                  >=4.20 && <4.22
     , bytestring
     , filepath
     , optparse-applicative

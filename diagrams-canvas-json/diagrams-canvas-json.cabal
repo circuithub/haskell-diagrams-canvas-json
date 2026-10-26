@@ -28,7 +28,7 @@ library
   -- other-extensions:
   build-depends:
     , aeson
-    , base           ^>=4.20.2.0
+    , base           >=4.20 && <4.22
     , colour
     , containers
     , diagrams-core
@@ -51,5 +51,5 @@ test-suite diagrams-canvas-json-test
   hs-source-dirs:   test
   main-is:          Main.hs
   build-depends:
-    , base                  ^>=4.20.2.0
+    , base                  >=4.20 && <4.22
     , diagrams-canvas-json

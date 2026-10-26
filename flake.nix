@@ -9,7 +9,7 @@
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     flake-root.url = "github:srid/flake-root";
     just-flake.url = "github:juspay/just-flake";
-    haskell-gerber.url = "github:circuithub/haskell-gerber/9b0c1cb3dc9e90f5af393248ca17038d25b70c42";
+    haskell-gerber.url = "github:circuithub/haskell-gerber/f3f6ce800a5f0bf4ec214d3f9e56069bbf5e3055";
     haskell-gerber.flake = false;
   };
 

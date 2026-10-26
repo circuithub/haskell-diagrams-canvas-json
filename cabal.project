@@ -34,11 +34,11 @@ constraints: diagrams-lib < 1.5
 source-repository-package
   type: git
   location: https://github.com/circuithub/haskell-gerber
-  tag: 9b0c1cb3dc9e90f5af393248ca17038d25b70c42
+  tag: f3f6ce800a5f0bf4ec214d3f9e56069bbf5e3055
   subdir: gerber
 
 source-repository-package
   type: git
   location: https://github.com/circuithub/haskell-gerber
-  tag: 9b0c1cb3dc9e90f5af393248ca17038d25b70c42
+  tag: f3f6ce800a5f0bf4ec214d3f9e56069bbf5e3055
   subdir: gerber-diagrams

@@ -22,7 +22,7 @@ library
   import:           warnings
   exposed-modules:  Diagrams.Backend.CanvasJson.Cairo
   build-depends:
-    , base                  ^>=4.20.2.0
+    , base                  >=4.20 && <4.22
     , bytestring
     , diagrams-canvas-json
     , filepath
@@ -38,7 +38,7 @@ executable diagrams-canvas-json-cairo
   main-is:          Main.hs
   build-depends:
     , aeson
-    , base                        ^>=4.20.2.0
+    , base                        >=4.20 && <4.22
     , bytestring
     , diagrams-canvas-json
     , diagrams-canvas-json-cairo

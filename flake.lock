@@ -51,17 +51,17 @@
     "haskell-gerber": {
       "flake": false,
       "locked": {
-        "lastModified": 1750433993,
-        "narHash": "sha256-I1mWLQ7S1mtqb/jNY4o4WAgaMUkftSWqiysWj5Ov1OE=",
+        "lastModified": 1793015360,
+        "narHash": "sha256-gOOJR2Lziol5816pzjYzso7/5mx+F3T5q6FmqgvK6Cc=",
         "owner": "circuithub",
         "repo": "haskell-gerber",
-        "rev": "9b0c1cb3dc9e90f5af393248ca17038d25b70c42",
+        "rev": "f3f6ce800a5f0bf4ec214d3f9e56069bbf5e3055",
         "type": "github"
       },
       "original": {
         "owner": "circuithub",
         "repo": "haskell-gerber",
-        "rev": "9b0c1cb3dc9e90f5af393248ca17038d25b70c42",
+        "rev": "f3f6ce800a5f0bf4ec214d3f9e56069bbf5e3055",
         "type": "github"
       }
     },

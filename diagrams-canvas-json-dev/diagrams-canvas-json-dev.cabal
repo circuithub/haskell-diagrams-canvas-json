@@ -23,7 +23,7 @@ executable diagrams-canvas-json-dev
   main-is:          Main.hs
   build-depends:
     , aeson
-    , base                  ^>=4.20.2.0
+    , base                  >=4.20 && <4.22
     , bytestring
     , diagrams
     , diagrams-canvas-json
