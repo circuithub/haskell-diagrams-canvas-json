@@ -799,17 +799,19 @@ mergeSaveRestore cmds@(x : xs) =
                     -- Non-uniform context: emit group unchanged
                     (CmdSave : group ++ [CmdRestore]) ++ mergeSaveRestore remaining
                 Just ctx ->
-                    let (merged, unmerged) = mergeWhileSameContext ctx group remaining
+                    let (merged, unmerged) = mergeWhileSameContext ctx [group] remaining
                      in merged ++ mergeSaveRestore unmerged
 
-mergeWhileSameContext :: GroupContext -> [CanvasCmd] -> [CanvasCmd] -> ([CanvasCmd], [CanvasCmd])
-mergeWhileSameContext ctx group next =
+-- The groups merged so far are kept newest first and joined once, as
+-- appending each group to the merged ones would copy them every time.
+mergeWhileSameContext :: GroupContext -> [[CanvasCmd]] -> [CanvasCmd] -> ([CanvasCmd], [CanvasCmd])
+mergeWhileSameContext ctx groups next =
     case stripSaveRestore next of
         Just (nextGroup, nextRemaining)
             | extractContext nextGroup == Just ctx ->
-                mergeWhileSameContext ctx (group ++ nextGroup) nextRemaining
+                mergeWhileSameContext ctx (nextGroup : groups) nextRemaining
         _ ->
-            (CmdSave : (contextToSetCmds ctx ++ stripContext group ++ [CmdRestore]), next)
+            (CmdSave : (contextToSetCmds ctx ++ stripContext (concat (reverse groups)) ++ [CmdRestore]), next)
 
 -- Strip a blanced CmdSave CmdRestore from the command stream.
 --
