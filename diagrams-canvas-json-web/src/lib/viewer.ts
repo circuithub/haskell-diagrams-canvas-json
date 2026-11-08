@@ -27,6 +27,18 @@ export interface LayeredDiagram {
   height: number;
   bounds: BBox;
   layers: MaskLayer[];
+  /** Drawn after every layer's own commands, kept once rather than in each layer */
+  punch?: CanvasCommand[];
+}
+
+/** The layers with the diagram's punch drawn into each, as they are composited */
+export function punchedLayers(diagram: LayeredDiagram): MaskLayer[] {
+  const punch = diagram.punch;
+  if (!punch || punch.length === 0) return diagram.layers;
+  return diagram.layers.map((layer) => ({
+    ...layer,
+    commands: layer.commands.concat(punch),
+  }));
 }
 
 /**
@@ -146,17 +158,18 @@ const DEFAULT_CHECKERBOARD =
  * const viewer = createViewer({
  *   container: document.getElementById('viewer')!,
  *   bounds: diagram.bounds,
- *   layers: diagram.layers,
+ *   layers: punchedLayers(diagram),
  * });
  *
  * // With interleaved custom layer
+ * const [substrate, copper] = punchedLayers(diagram);
  * const viewer = createViewer({
  *   container: document.getElementById('viewer')!,
  *   bounds: diagram.bounds,
  *   layers: [
- *     diagram.layers[0],
+ *     substrate,
  *     { render: (ctx, scale) => { ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 10, 10); } },
- *     diagram.layers[1],
+ *     copper,
  *   ],
  * });
  * ```

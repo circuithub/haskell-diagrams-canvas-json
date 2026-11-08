@@ -38,6 +38,7 @@ module Diagrams.Backend.CanvasJson (
     MaskLayer (..),
     LayeredDiagram (..),
     encodeMaskLayer,
+    punchedLayers,
 
     -- * Optimization
     optimizeCommands,
@@ -407,20 +408,30 @@ data LayeredDiagram = LayeredDiagram
     , ldHeight :: !Double
     , ldBounds :: !BBox
     , ldLayers :: ![MaskLayer]
+    , ldPunch :: ![CanvasCmd]
+    -- ^ Drawn after every layer's own commands, such as the holes through
+    -- the whole board, so they are kept once rather than in each layer.
     , ldPrecision :: !JsonPrecision
     }
     deriving (Show, Eq)
+
+-- | The layers with 'ldPunch' drawn into each, as they are composited.
+punchedLayers :: LayeredDiagram -> [MaskLayer]
+punchedLayers mld
+    | null (ldPunch mld) = ldLayers mld
+    | otherwise = [layer{mlCommands = mlCommands layer ++ ldPunch mld} | layer <- ldLayers mld]
 
 -- | Encode using the precision stored in the diagram.
 instance ToJSON LayeredDiagram where
     toJSON mld =
         let jp = ldPrecision mld
-         in A.object
+         in A.object $
                 [ "width" A..= roundN (jpDimensions jp) (ldWidth mld)
                 , "height" A..= roundN (jpDimensions jp) (ldHeight mld)
                 , "bounds" A..= encodeBBox jp (ldBounds mld)
                 , "layers" A..= map (encodeMaskLayer jp) (ldLayers mld)
                 ]
+                    ++ ["punch" A..= map (encodeCmd jp) (ldPunch mld) | not (null (ldPunch mld))]
 
 -- | Decoding loses the original precision; 'defaultJsonPrecision' is used.
 instance FromJSON LayeredDiagram where
@@ -430,6 +441,7 @@ instance FromJSON LayeredDiagram where
             <*> o A..: "height"
             <*> o A..: "bounds"
             <*> o A..: "layers"
+            <*> o A..:? "punch" A..!= []
             <*> pure defaultJsonPrecision
 
 --------------------------------------------------------------------------------

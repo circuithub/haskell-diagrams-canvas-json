@@ -45,6 +45,7 @@ import Diagrams.Backend.CanvasJson (
     CompositeOp (..),
     LayeredDiagram (..),
     MaskLayer (..),
+    punchedLayers,
  )
 import GI.Cairo.Render qualified as C
 import GI.Cairo.Render.Matrix (Matrix (..))
@@ -150,7 +151,7 @@ renderLayeredDiagramTo fmt path opts mld =
         drawBackground opts
         let bounds = ldBounds mld
             scale = fitScale opts bounds
-        for_ (ldLayers mld) $ \layer -> do
+        for_ (punchedLayers mld) $ \layer -> do
             C.pushGroup
             C.save
             applyFitTransform opts bounds

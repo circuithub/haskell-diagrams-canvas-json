@@ -270,7 +270,9 @@ layoutBody LBoard renderer mh mv =
         [ "  " <> createCall renderer <> "({"
         , "    container: document.getElementById('wrap'),"
         , "    bounds: data.bounds,"
-        , "    layers: data.layers,"
+        , "    layers: data.layers.map(function (l) {"
+        , "      return Object.assign({}, l, { commands: l.commands.concat(data.punch || []) });"
+        , "    }),"
         , mirrorOpts mh mv
         , "  });"
         ]

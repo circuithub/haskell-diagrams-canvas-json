@@ -675,6 +675,7 @@ buildBoardDiagram outline throughs mBaseColor entries =
         , ldHeight = maximum allHeights
         , ldBounds = foldl1 unionBBox allBounds
         , ldLayers = baseLayer ++ map buildOne entries
+        , ldPunch = concatMap (transformPolarityInverted . cdCommands) throughs
         , ldPrecision = cdPrecision outline
         }
   where
@@ -683,12 +684,10 @@ buildBoardDiagram outline throughs mBaseColor entries =
     allHeights = map cdHeight allDiagrams
     allBounds = map cdBounds allDiagrams
 
-    -- Outline filled with colour, through-layers punched out
-    filledOutlineWithHoles color =
+    filledOutline color =
         optimizeCommands $
             recolorCommands color $
                 outlineToFilled (0, 0, 0, 1) (cdCommands outline)
-                    ++ concatMap (transformPolarityInverted . cdCommands) throughs
 
     baseLayer = case mBaseColor of
         Nothing -> []
@@ -696,7 +695,7 @@ buildBoardDiagram outline throughs mBaseColor entries =
             [ MaskLayer
                 { mlName = Just "substrate"
                 , mlColor = color
-                , mlCommands = filledOutlineWithHoles color
+                , mlCommands = filledOutline color
                 }
             ]
 
@@ -704,7 +703,7 @@ buildBoardDiagram outline throughs mBaseColor entries =
         MaskLayer
             { mlName = blsName spec
             , mlColor = blsColor spec
-            , mlCommands = buildBoardLayerCommands (blsColor spec) (blsOutlineMode spec) base outline throughs
+            , mlCommands = buildBoardLayerCommands (blsColor spec) (blsOutlineMode spec) base outline []
             }
 
 --------------------------------------------------------------------------------

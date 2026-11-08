@@ -6,11 +6,17 @@
  */
 
 export type { CanvasDiagram, CanvasCommand, Color, BBox } from "./types.js";
-export { isCommandLayer, isCustomLayer, isMaskLayer } from "./viewer.js";
+export {
+  isCommandLayer,
+  isCustomLayer,
+  isMaskLayer,
+  punchedLayers,
+} from "./viewer.js";
 export type {
   CommandLayer,
   CustomLayer,
   CustomLayerRenderer,
+  LayeredDiagram,
   MaskLayer,
   ViewerLayer,
 } from "./viewer.js";

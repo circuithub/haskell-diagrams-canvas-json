@@ -12,6 +12,7 @@ export {
   isCommandLayer,
   isCustomLayer,
   isMaskLayer,
+  punchedLayers,
 } from "./viewer.js";
 export type {
   CommandLayer,
