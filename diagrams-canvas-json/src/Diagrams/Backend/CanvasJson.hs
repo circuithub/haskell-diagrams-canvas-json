@@ -641,9 +641,45 @@ renderTrail t startPt = withTrail renderLine renderLoop t
   where
     renderLine ln = mapM_ renderSeg (lineSegments ln)
     renderLoop lp = do
-        mapM_ renderSeg (lineSegments $ cutLoop lp)
+        let segs = lineSegments $ cutLoop lp
+        case loopCircle startPt segs of
+            Just (V2 cx cy, r, startAngle) -> emit $ CmdArc cx cy r startAngle (startAngle + 2 * pi)
+            Nothing -> mapM_ renderSeg segs
         emit CmdClosePath
         setPos startPt -- Loop returns to start
+
+{- | The centre, radius and start angle of a loop of cubic segments tracing a
+whole circle anticlockwise, as diagrams draws circles, so that it can be sent as
+one arc rather than its Béziers. Clockwise circles are left as Béziers, as an arc
+command only sweeps anticlockwise in every renderer.
+-}
+loopCircle :: P2 Double -> [Segment Closed V2 Double] -> Maybe (V2 Double, Double, Double)
+loopCircle (P first) segs@(Cubic v1 _ (OffsetClosed w) : _ : _)
+    | w `dot` inward > 0
+    , and (zipWith3 tracesArc ends (drop 1 ends) segs)
+    , abs (sum (zipWith sweep ends (drop 1 ends)) - 2 * pi) <= 1e-9 =
+        Just (centre, r, angleOf first)
+  where
+    ends = scanl (\p seg -> p + segOffset seg) first segs
+    -- The centre is on the left of the first segment's start, equally far from its end.
+    inward = perp (signorm v1)
+    r = quadrance w / (2 * (w `dot` inward))
+    centre = first + r *^ inward
+    tolerance = 1e-9 * max 1 r
+    near a b = norm (a - b) <= tolerance
+    angleOf p = let V2 x y = p - centre in atan2 y x
+    sweep p q = let a = angleOf q - angleOf p in if a <= 0 then a + 2 * pi else a
+    -- The Bézier diagrams draws for an arc of at most a quarter turn
+    tracesArc p q (Cubic c1 c2 _) =
+        let s = sweep p q
+            k = 4 / 3 * tan (s / 4)
+         in s <= pi / 2 + 1e-9
+                && abs (norm (q - centre) - r) <= tolerance
+                && near c1 (k *^ perp (p - centre))
+                && near (p + c2) (q - k *^ perp (q - centre))
+    tracesArc _ _ _ = False
+loopCircle _ _ = Nothing
+
 
 -- | Render a single segment, converting offsets to absolute coordinates
 renderSeg :: Segment Closed V2 Double -> RenderM ()
