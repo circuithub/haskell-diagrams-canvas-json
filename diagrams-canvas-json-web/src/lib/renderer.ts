@@ -1,4 +1,6 @@
 import type { CanvasDiagram, CanvasCommand, Color, BBox } from "./types.js";
+import { drawImageMask } from "./raster.js";
+import type { RasterCache } from "./raster.js";
 
 /** Convert RGBA values (0-255 for RGB, 0-1 for alpha) to CSS string */
 function rgbaToCss(r: number, g: number, b: number, a: number): string {
@@ -91,6 +93,16 @@ export function calculateFitTransform(
   return { a, b, c, d, e, f, scale };
 }
 
+/** Options for {@link executeCommands} */
+export interface ExecuteOptions {
+  /** Bitmaps from {@link prepareRasters}; missing ones are decoded lazily */
+  rasters?: RasterCache;
+  /** Called when a lazily decoded IM bitmap becomes ready, to render again */
+  onRasterReady?: () => void;
+  /** The output is tinted afterwards (mask layer), so IM colours are unused */
+  mask?: boolean;
+}
+
 /**
  * Execute a single canvas command
  * @param scale - The current transform scale, used for view-relative line widths (KV/KSV commands)
@@ -99,6 +111,7 @@ function executeCommand(
   ctx: CanvasRenderingContext2D,
   cmd: CanvasCommand,
   scale: number,
+  opts: ExecuteOptions,
 ): void {
   const opcode = cmd[0];
 
@@ -253,6 +266,10 @@ function executeCommand(
       break;
     }
 
+    case "IM":
+      drawImageMask(ctx, cmd, opts);
+      break;
+
     default:
       console.warn(`Unknown canvas command: ${opcode}`);
   }
@@ -266,9 +283,10 @@ export function executeCommands(
   ctx: CanvasRenderingContext2D,
   commands: CanvasCommand[],
   scale: number,
+  opts: ExecuteOptions = {},
 ): void {
   for (const cmd of commands) {
-    executeCommand(ctx, cmd, scale);
+    executeCommand(ctx, cmd, scale, opts);
   }
 }
 
@@ -286,7 +304,16 @@ export interface RenderOptions {
   mirrorH?: boolean;
   /** Mirror the image vertically (flip top/bottom). Default: false. */
   mirrorV?: boolean;
+  /**
+   * Bitmaps from {@link prepareRasters}. Without them IM commands draw on a
+   * later frame, once decoded, by rendering the whole canvas again; pass
+   * them when drawing over the result.
+   */
+  rasters?: RasterCache;
 }
+
+// The latest render of each canvas, so a late redraw cannot replace it.
+const latestRender = new WeakMap<HTMLCanvasElement, object>();
 
 /**
  * Render a canvas diagram (command-based format) to an HTML canvas element
@@ -344,7 +371,20 @@ export function renderDiagram(
     transform.f,
   );
 
-  executeCommands(ctx, diagram.commands, transform.scale);
+  const token = {};
+  latestRender.set(canvas, token);
+  let redrawQueued = false;
+  executeCommands(ctx, diagram.commands, transform.scale, {
+    rasters: options.rasters,
+    onRasterReady: () => {
+      if (redrawQueued) return;
+      redrawQueued = true;
+      requestAnimationFrame(() => {
+        if (latestRender.get(canvas) === token)
+          renderDiagram(canvas, diagram, options);
+      });
+    },
+  });
 
   ctx.restore();
 }

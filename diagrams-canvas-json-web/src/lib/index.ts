@@ -4,9 +4,17 @@
  * TypeScript library for rendering diagrams-canvas-json output using HTML Canvas
  */
 
-export type { CanvasDiagram, CanvasCommand, Color, BBox } from "./types.js";
+export type {
+  CanvasDiagram,
+  CanvasCommand,
+  Color,
+  BBox,
+  ImageMaskCommand,
+} from "./types.js";
 export { executeCommands, renderDiagram } from "./renderer.js";
-export type { RenderOptions } from "./renderer.js";
+export type { ExecuteOptions, RenderOptions } from "./renderer.js";
+export { drawImageMask, prepareRasters, retainRasters } from "./raster.js";
+export type { RasterCache, RasterSource } from "./raster.js";
 export {
   createViewer,
   isCommandLayer,

@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
@@ -34,6 +35,16 @@ module Diagrams.Backend.CanvasJson (
     compositeOpToText,
     compositeOpFromText,
 
+    -- * Image masks
+    MaskPng (..),
+    parseMaskPng,
+    maskPngWidth,
+    maskPngHeight,
+    maskPngBase64,
+    maskPngFromBase64,
+    maxMaskPngSide,
+    imageMaskRectDecimals,
+
     -- * Multi-layer diagrams
     MaskLayer (..),
     LayeredDiagram (..),
@@ -44,14 +55,18 @@ module Diagrams.Backend.CanvasJson (
     optimizeCommands,
 ) where
 
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Control.Monad.State.Strict
 import Data.Aeson (FromJSON (..), ToJSON (..))
 import Data.Aeson qualified as A
 import Data.Aeson.Types qualified as A
+import Data.Bits (shiftL, (.&.), (.|.))
+import Data.ByteString qualified as BS
+import Data.ByteString.Base64 qualified as B64
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Scientific (scientific)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Tree (Tree (..))
 import Data.Typeable (Typeable)
 import Diagrams.Core.Compile (RNode (..), RTree, fromDTree, toDTree)
@@ -152,7 +167,128 @@ data CanvasCmd
     | CmdSetFont !String
     | -- Canvas state
       CmdSetGlobalCompositeOperation !CompositeOp
+    | {- Image mask: RGBA, then the rectangle x0 y0 x1 y1 the PNG covers. Fills
+      the PNG's set pixels with the colour under the current GCO and transform,
+      leaving the path and fill style alone. PNG row 0 is at y1.
+      -}
+      CmdImageMask !Double !Double !Double !Double !Double !Double !Double !Double !MaskPng
     deriving (Show, Eq, Generic)
+
+{- | Longest side of a 'MaskPng'. It is the WebGL texture size floor, and it
+bounds what a decoder inflates before it can reject a payload.
+-}
+maxMaskPngSide :: Int
+maxMaskPngSide = 4096
+
+{- | Decimals of the @IM@ rectangle on the wire, at least the coordinate
+precision. The decoder demands square pixels, so the edges must survive
+rounding: producers keep them on a grid of @10^-imageMaskRectDecimals@.
+-}
+imageMaskRectDecimals :: Int
+imageMaskRectDecimals = 6
+
+{- | The PNG bytes of a 'CmdImageMask': 1-bit greyscale, non-interlaced, with a
+@tRNS@ making grey 0 transparent, so unset pixels leave the destination alone
+under source-over and destination-out. 'parseMaskPng' checks this profile.
+-}
+newtype MaskPng = MaskPng BS.ByteString
+    deriving newtype (Eq, Ord)
+
+-- Payloads are hundreds of kilobytes, so show only their size.
+instance Show MaskPng where
+    showsPrec _ png@(MaskPng bs) =
+        showString "<MaskPng "
+            . shows (maskPngWidth png)
+            . showChar 'x'
+            . shows (maskPngHeight png)
+            . showString ", "
+            . shows (BS.length bs)
+            . showString " bytes>"
+
+-- | Pixel width from the IHDR, 0 if there is none.
+maskPngWidth :: MaskPng -> Int
+maskPngWidth (MaskPng bs) = be32At 16 bs
+
+-- | Pixel height from the IHDR, 0 if there is none.
+maskPngHeight :: MaskPng -> Int
+maskPngHeight (MaskPng bs) = be32At 20 bs
+
+be32At :: Int -> BS.ByteString -> Int
+be32At i bs
+    | BS.length bs < i + 4 = 0
+    | otherwise = foldl (\acc k -> acc `shiftL` 8 .|. fromIntegral (BS.index bs (i + k))) 0 [0 .. 3]
+
+-- | Standard padded base64, as the payload is sent on the wire.
+maskPngBase64 :: MaskPng -> T.Text
+maskPngBase64 (MaskPng bs) = TE.decodeLatin1 (B64.encode bs)
+
+-- | Decode a wire payload and check it with 'parseMaskPng'.
+maskPngFromBase64 :: T.Text -> Either String MaskPng
+maskPngFromBase64 t = case B64.decode (TE.encodeUtf8 t) of
+    Left err -> Left ("IM payload is not standard padded base64: " <> err)
+    Right bs -> parseMaskPng bs
+
+{- | Check the 'MaskPng' profile. Chunk CRCs and the image data are left to the
+decoders that inflate it.
+-}
+parseMaskPng :: BS.ByteString -> Either String MaskPng
+parseMaskPng bs = do
+    unless (pngSignature `BS.isPrefixOf` bs) $ Left "IM payload is not a PNG: bad signature"
+    chunks <- pngChunks (BS.drop 8 bs)
+    case chunks of
+        (("IHDR", ihdr) : rest) -> checkIhdr ihdr >> checkChunks rest
+        _ -> Left "IM PNG must start with an IHDR chunk"
+    pure $! MaskPng bs
+  where
+    checkIhdr ihdr = do
+        unless (BS.length ihdr == 13) $ Left "IM PNG IHDR must be 13 bytes"
+        unless (be32At 0 ihdr > 0 && be32At 4 ihdr > 0) $ Left "IM PNG width and height must be positive"
+        unless (be32At 0 ihdr <= maxMaskPngSide && be32At 4 ihdr <= maxMaskPngSide) $
+            Left ("IM PNG sides must be at most " <> show maxMaskPngSide <> " px")
+        let field = BS.index ihdr
+        unless (field 8 == 1) $ Left ("IM PNG bit depth must be 1, got " <> show (field 8))
+        unless (field 9 == 0) $ Left ("IM PNG colour type must be 0 (greyscale), got " <> show (field 9))
+        unless (field 10 == 0 && field 11 == 0) $ Left "IM PNG compression and filter methods must be 0"
+        unless (field 12 == 0) $ Left "IM PNG must not be interlaced"
+    -- Browsers reject unknown critical chunks and IDATs split by other chunks,
+    -- so allow only what every decoder reads the same way.
+    checkChunks rest = do
+        let (beforeData, fromData) = break ((== "IDAT") . fst) rest
+            afterData = dropWhile ((== "IDAT") . fst) fromData
+            outside = beforeData ++ afterData
+        when (null fromData) $ Left "IM PNG has no IDAT chunk"
+        case filter (not . isAncillary) (map fst outside) of
+            "IDAT" : _ -> Left "IM PNG IDAT chunks must be consecutive"
+            "IHDR" : _ -> Left "IM PNG must have one IHDR chunk"
+            ty : _ -> Left ("IM PNG must not have a " <> show ty <> " chunk")
+            [] -> pure ()
+        -- Their layout depends on the colour type, which tinting rewrites.
+        case filter (`elem` ["bKGD", "sBIT", "hIST"]) (map fst outside) of
+            ty : _ -> Left ("IM PNG must not have a " <> show ty <> " chunk")
+            [] -> pure ()
+        case [trns | ("tRNS", trns) <- beforeData] of
+            [] -> Left "IM PNG must have a tRNS chunk before IDAT"
+            [trns] -> unless (trns == BS.pack [0, 0]) $ Left "IM PNG tRNS must make grey 0 transparent"
+            _ -> Left "IM PNG must have one tRNS chunk"
+        when (any ((== "tRNS") . fst) afterData) $ Left "IM PNG must have one tRNS chunk"
+    isAncillary ty = BS.index ty 0 .&. 0x20 /= 0
+
+pngSignature :: BS.ByteString
+pngSignature = BS.pack [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+
+-- The chunks before IEND as (type, data).
+pngChunks :: BS.ByteString -> Either String [(BS.ByteString, BS.ByteString)]
+pngChunks bs
+    | BS.length bs < 12 = Left "IM PNG is truncated or has no IEND chunk"
+    | BS.length bs < 12 + len = Left "IM PNG is truncated"
+    | ty == "IEND" =
+        if len /= 0
+            then Left "IM PNG IEND must be empty"
+            else if BS.length bs == 12 then Right [] else Left "IM PNG has data after IEND"
+    | otherwise = ((ty, BS.take len (BS.drop 8 bs)) :) <$> pngChunks (BS.drop (12 + len) bs)
+  where
+    len = be32At 0 bs
+    ty = BS.take 4 (BS.drop 4 bs)
 
 {- | Subset of Canvas 2D @globalCompositeOperation@ values that this backend
 actually emits. Using a closed enumeration lets producers and consumers
@@ -227,7 +363,10 @@ encodeCmd jp cmd = case cmd of
     CmdFillText txt x y -> A.toJSON [A.String "FT", A.toJSON txt, co x, co y]
     CmdSetFont f -> A.toJSON [A.String "SF", A.toJSON f]
     CmdSetGlobalCompositeOperation gco -> A.toJSON [A.String "GCO", A.toJSON (compositeOpToText gco)]
+    CmdImageMask r g b a x0 y0 x1 y1 png ->
+        A.toJSON [A.String "IM", col r, col g, col b, al a, imc x0, imc y0, imc x1, imc y1, A.String (maskPngBase64 png)]
   where
+    imc = roundN (max imageMaskRectDecimals (jpCoordinates jp))
     co = roundN (jpCoordinates jp)
     col = roundN 0
     al = roundN (jpAlpha jp)
@@ -282,11 +421,39 @@ instance FromJSON CanvasCmd where
             CmdFillText <$> parseJSON txt <*> num x <*> num y
         [A.String "SF", f] -> CmdSetFont <$> parseJSON f
         [A.String "GCO", gco] -> CmdSetGlobalCompositeOperation <$> parseJSON gco
+        [A.String "IM", r, g, b, a, x0, y0, x1, y1, png] -> do
+            cmd <-
+                CmdImageMask
+                    <$> num r
+                    <*> num g
+                    <*> num b
+                    <*> num a
+                    <*> num x0
+                    <*> num y0
+                    <*> num x1
+                    <*> num y1
+                    <*> A.withText "IM payload" (either fail pure . maskPngFromBase64) png
+            either fail (const (pure cmd)) (checkImageMaskRect cmd)
         _ -> fail $ "Unrecognised canvas command array: " <> show (A.Array arr)
       where
         toListV = foldr (:) []
         num :: A.Value -> A.Parser Double
         num = parseJSON
+
+{- | Renderers derive one pixel pitch from the rectangle, so a stretched mask
+would be placed differently by each of them.
+-}
+checkImageMaskRect :: CanvasCmd -> Either String ()
+checkImageMaskRect (CmdImageMask _ _ _ _ x0 y0 x1 y1 png) = do
+    unless (all finite [x0, y0, x1, y1]) $ Left "IM rectangle must be finite"
+    unless (x1 > x0 && y1 > y0) $ Left "IM rectangle must have x1 > x0 and y1 > y0"
+    let sx = (x1 - x0) / fromIntegral (maskPngWidth png)
+        sy = (y1 - y0) / fromIntegral (maskPngHeight png)
+    unless (abs (sx - sy) <= 1e-9 * max sx sy) $
+        Left ("IM pixels must be square, got pitches " <> show sx <> " by " <> show sy)
+  where
+    finite v = not (isNaN v || isInfinite v)
+checkImageMaskRect _ = Right ()
 
 -- | Bounding box for the diagram
 data BBox = BBox
@@ -409,8 +576,9 @@ data LayeredDiagram = LayeredDiagram
     , ldBounds :: !BBox
     , ldLayers :: ![MaskLayer]
     , ldPunch :: ![CanvasCmd]
-    -- ^ Drawn after every layer's own commands, such as the holes through
-    -- the whole board, so they are kept once rather than in each layer.
+    {- ^ Drawn after every layer's own commands, such as the holes through
+    the whole board, so they are kept once rather than in each layer.
+    -}
     , ldPrecision :: !JsonPrecision
     }
     deriving (Show, Eq)
@@ -692,7 +860,6 @@ loopCircle (P first) segs@(Cubic v1 _ (OffsetClosed w) : _ : _)
     tracesArc _ _ _ = False
 loopCircle _ _ = Nothing
 
-
 -- | Render a single segment, converting offsets to absolute coordinates
 renderSeg :: Segment Closed V2 Double -> RenderM ()
 renderSeg (Linear (OffsetClosed off)) = do
@@ -827,6 +994,7 @@ stripTransparent = filter (not . isTransparent)
     isTransparent (CmdFill _ _ _ a) = a < 0.001
     isTransparent (CmdStroke _ _ _ a _) = a < 0.001
     isTransparent (CmdStrokeView _ _ _ a _) = a < 0.001
+    isTransparent (CmdImageMask _ _ _ a _ _ _ _ _) = a < 0.001
     isTransparent _ = False
 
 {- | Merge consecutive Save\/Restore groups that have identical context-setting
@@ -910,6 +1078,8 @@ extractContext = go False False emptyCtx . skipSaveRestore (0 :: Int)
     go _ ss ctx (CmdFill r g b a : rest)
         | isUniform (gcFill ctx) (r, g, b, a) = go True ss ctx{gcFill = Just (r, g, b, a)} rest
         | otherwise = Nothing
+    -- An image mask carries its own colour, so it is a fill draw without context
+    go _ ss ctx (CmdImageMask{} : rest) = go True ss ctx rest
     -- Stroke draws
     go sf _ ctx (CmdStroke r g b a lw' : rest)
         | isUniform (gcStroke ctx) (StrokeCoord, r, g, b, a, lw') = go sf True ctx{gcStroke = Just (StrokeCoord, r, g, b, a, lw')} rest

@@ -56,7 +56,28 @@ export type CanvasCommand =
   | ["FT", string, number, number] // FillText text, x, y
   | ["SF", string] // SetFont
   // Canvas state
-  | ["GCO", CompositeOp]; // SetGlobalCompositeOperation
+  | ["GCO", CompositeOp] // SetGlobalCompositeOperation
+  // Raster
+  | ImageMaskCommand;
+
+/**
+ * Fill colour RGBA (like F) through a 1-bit greyscale+tRNS PNG (base64) that
+ * covers [x0,x1] x [y0,y1] with square pixels and PNG row 0 at y1. Set pixels
+ * are filled under the current transform and composite operation; unset
+ * pixels leave the destination untouched.
+ */
+export type ImageMaskCommand = [
+  "IM",
+  r: number,
+  g: number,
+  b: number,
+  a: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  png: string,
+];
 
 /**
  * Subset of Canvas 2D `globalCompositeOperation` values that the backend

@@ -3,16 +3,20 @@ import {
   Container,
   Graphics,
   GraphicsContext,
+  ImageSource,
   Matrix,
   Text,
+  Texture,
 } from "pixi.js";
 import type {
   CanvasDiagram,
   CanvasCommand,
   Color,
   CompositeOp,
+  ImageMaskCommand,
 } from "./types.js";
 import { calculateFitTransform } from "./renderer.js";
+import { holdRaster, rasterFor } from "./raster.js";
 
 /** Drawing state tracked manually (Canvas 2D has this built-in) */
 interface DrawState {
@@ -148,6 +152,87 @@ function emitArc(
 }
 
 /**
+ * GPU textures for IM payloads, owned by whoever renders with them.
+ *
+ * Textures hold the untinted payload; the IM colour is applied as the quad
+ * tint, so every colour and the mask pass share one texture per payload.
+ */
+export interface RasterTextures {
+  /** The texture for `cmd`, or undefined while its bitmap decodes */
+  get(cmd: ImageMaskCommand): Texture | undefined;
+  /** Destroy textures not requested by `get` since the previous sweep */
+  sweep(): void;
+  destroy(): void;
+}
+
+/**
+ * Destroy a texture without letting its death notify shared PixiJS state.
+ *
+ * See Note [Viewer teardown is page-local] in viewer-pixi.ts.
+ */
+export function destroyTextureQuietly(texture: Texture): void {
+  const source = texture.source;
+  // Unload while still live: "unload" is the only path that deletes the GL
+  // texture, and its "change" merely dirties a shared BindGroup.
+  source.unload();
+  source.style?.removeAllListeners();
+  // Keep "destroy": the renderer frees a render texture's framebuffer on it.
+  source.removeAllListeners("change");
+  texture.destroy(true);
+}
+
+/**
+ * @param onReady - called when a bitmap requested by `get` finishes decoding,
+ *   so the caller can rebuild the scenes that skipped it
+ */
+export function createRasterTextures(onReady?: () => void): RasterTextures {
+  // Each texture holds its bitmap open, which the ImageSource re-uploads from.
+  const textures = new Map<string, { texture: Texture; unhold: () => void }>();
+  let used = new Set<string>();
+  const drop = (t: { texture: Texture; unhold: () => void }) => {
+    destroyTextureQuietly(t.texture);
+    t.unhold();
+  };
+  return {
+    get(cmd) {
+      const payload = cmd[9];
+      used.add(payload);
+      const existing = textures.get(payload);
+      if (existing) return existing.texture;
+      const bitmap = rasterFor(cmd, true, onReady);
+      if (!bitmap) return undefined;
+      // Crisp pixels when magnified; mipmaps (where the GPU supports them for
+      // this size) keep small holes visible when minified.
+      const texture = new Texture({
+        source: new ImageSource({
+          resource: bitmap,
+          autoGenerateMipmaps: true,
+          magFilter: "nearest",
+          minFilter: "linear",
+          mipmapFilter: "linear",
+        }),
+      });
+      textures.set(payload, { texture, unhold: holdRaster(cmd, true) });
+      return texture;
+    },
+    sweep() {
+      for (const [payload, t] of textures) {
+        if (!used.has(payload)) {
+          drop(t);
+          textures.delete(payload);
+        }
+      }
+      used = new Set();
+    },
+    destroy() {
+      for (const t of textures.values()) drop(t);
+      textures.clear();
+      used = new Set();
+    },
+  };
+}
+
+/**
  * Execute a list of canvas commands, populating a PixiJS Container.
  *
  * Uses a single GraphicsContext per blend-mode group, accumulating all
@@ -160,11 +245,13 @@ function emitArc(
  * @param parent - The Container to add display objects to
  * @param commands - The command stream to interpret
  * @param scale - The current transform scale, used for view-relative line widths
+ * @param textures - textures for IM commands; without them IM is skipped
  */
 export function executeCommandsPixi(
   parent: Container,
   commands: CanvasCommand[],
   scale: number,
+  textures?: RasterTextures,
 ): void {
   let state = defaultState();
   const stateStack: DrawState[] = [];
@@ -412,6 +499,27 @@ export function executeCommandsPixi(
         break;
       }
 
+      // Raster mask — a textured quad in the current blend-mode group
+      case "IM": {
+        const tex = textures?.get(cmd);
+        if (!tex) break;
+        const c = ensureGfx();
+        const [, r, g, b, a, x0, , x1, y1] = cmd;
+        const w = tex.frame.width;
+        const h = tex.frame.height;
+        const p = (x1 - x0) / w;
+        // Flip through the transform: the quad builder drops negative sizes.
+        const m = currentTransform
+          .clone()
+          .append(new Matrix(p, 0, 0, -p, x0, y1));
+        c.save();
+        c.setTransform(m);
+        c.setFillStyle({ alpha: a });
+        c.texture(tex, rgbaToHex(r, g, b), 0, 0, w, h);
+        c.restore();
+        break;
+      }
+
       default:
         console.warn(`Unknown canvas command: ${opcode}`);
     }
@@ -428,6 +536,8 @@ export interface RenderPixiOptions {
   mirrorH?: boolean;
   /** Mirror the image vertically (flip top/bottom). Default: false. */
   mirrorV?: boolean;
+  /** Textures for IM commands, owned by the caller; without them IM is skipped */
+  textures?: RasterTextures;
 }
 
 /**
@@ -475,7 +585,12 @@ export function renderDiagramPixi(
   );
   app.stage.addChild(root);
 
-  executeCommandsPixi(root, diagram.commands, transform.scale);
+  executeCommandsPixi(
+    root,
+    diagram.commands,
+    transform.scale,
+    options.textures,
+  );
 }
 
 /**
@@ -484,7 +599,7 @@ export function renderDiagramPixi(
  * Used by the mask-texture viewer: each layer is rendered white-on-transparent
  * to a RenderTexture, then displayed via a tinted Sprite.
  *
- * - All fill/stroke color commands get their RGBA replaced with white (255,255,255,1)
+ * - All fill/stroke/IM color commands get their RGBA replaced with white (255,255,255,1)
  * - GCO commands pass through unchanged (PixiJS erase handles destination-out)
  * - All other commands pass through unchanged
  */
@@ -509,6 +624,20 @@ export function toMaskCommands(commands: CanvasCommand[]): CanvasCommand[] {
         break;
       case "KSV":
         result.push(["KSV", 255, 255, 255, 1, cmd[5]]);
+        break;
+      case "IM":
+        result.push([
+          "IM",
+          255,
+          255,
+          255,
+          1,
+          cmd[5],
+          cmd[6],
+          cmd[7],
+          cmd[8],
+          cmd[9],
+        ]);
         break;
       default:
         result.push(cmd);

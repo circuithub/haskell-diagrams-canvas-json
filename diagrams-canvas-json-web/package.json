@@ -26,7 +26,9 @@
     "build:bundle": "vite build --config vite.lib.config.ts",
     "build:bundle-pixi": "vite build --config vite.pixi.config.ts",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test test/",
+    "test:browser": "bun test/browser/run.ts"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

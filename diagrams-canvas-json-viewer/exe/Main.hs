@@ -183,13 +183,31 @@ bundleUrl :: Renderer -> T.Text
 bundleUrl RCanvas = "/lib/diagrams-canvas-json-web.js"
 bundleUrl RPixi = "/lib/diagrams-canvas-json-web-pixi.js"
 
-{- | Expression that resolves to the create-viewer function. When using PixiJS
-the factory is async so callers prefix the call with @await@ and mark the
-enclosing function as @async@ (our @main@ already is).
+{- | Expression that resolves to the create-viewer function. It is async
+(see 'createViewerJs'), so callers prefix the call with @await@ inside an
+@async@ function (our @main@ already is).
 -}
 createCall :: Renderer -> T.Text
-createCall RCanvas = "DiagramsCanvasJson.createViewer"
-createCall RPixi = "await DiagramsCanvasJsonPixi.createPixiViewer"
+createCall _ = "await createViewer"
+
+{- | Defines @createViewer(opts)@, which decodes the layers' raster masks
+before creating the viewer so they do not pop in on a later frame. The
+viewer holds its layers' bitmaps itself, so the prepared handle is released.
+-}
+createViewerJs :: Renderer -> T.Text
+createViewerJs renderer =
+    T.unlines
+        [ "async function createViewer(opts) {"
+        , "  opts.rasters = await " <> ns <> ".prepareRasters(opts.layers);"
+        , "  const viewer = " <> create <> "(opts);"
+        , "  opts.rasters.release();"
+        , "  return viewer;"
+        , "}"
+        ]
+  where
+    (ns, create) = case renderer of
+        RCanvas -> ("DiagramsCanvasJson", "DiagramsCanvasJson.createViewer")
+        RPixi -> ("DiagramsCanvasJsonPixi", "await DiagramsCanvasJsonPixi.createPixiViewer")
 
 viewerHtml :: T.Text -> Layout -> Renderer -> Bool -> Bool -> T.Text
 viewerHtml title layout renderer mirrorH mirrorV =
@@ -207,6 +225,7 @@ viewerHtml title layout renderer mirrorH mirrorV =
         , "<div id=\"error\"></div>"
         , "<script src=\"" <> bundleUrl renderer <> "\"></script>"
         , "<script>"
+        , createViewerJs renderer
         , "async function main() {"
         , "  const resp = await fetch('/api/data');"
         , "  if (!resp.ok) throw new Error('HTTP ' + resp.status);"

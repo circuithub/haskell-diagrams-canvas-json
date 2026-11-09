@@ -9,10 +9,18 @@ import type { BBox, CanvasCommand } from "./types.js";
 import type { ViewerLayer } from "./viewer.js";
 import { isMaskLayer, isCustomLayer } from "./viewer.js";
 import {
+  createRasterTextures,
+  destroyTextureQuietly,
   executeCommandsPixi,
   rgbaToHex,
   toMaskCommands,
 } from "./renderer-pixi.js";
+import type { RasterTextures } from "./renderer-pixi.js";
+import {
+  preparePixiRasters,
+  retainRasters,
+  sameLayerCommands,
+} from "./raster.js";
 
 /** Options for creating a PixiJS pan-zoom viewer */
 export interface PixiViewerOptions {
@@ -205,9 +213,10 @@ function buildCommandLayerState(
   height: number,
   resolution: number,
   scale: number,
+  textures: RasterTextures,
 ): CommandLayerState {
   const scene = new Container();
-  executeCommandsPixi(scene, commands, scale);
+  executeCommandsPixi(scene, commands, scale, textures);
   const renderTexture = RenderTexture.create({ width, height, resolution });
   const sprite = new Sprite(renderTexture);
   app.stage.addChild(sprite);
@@ -222,13 +231,14 @@ function buildMaskLayerState(
   height: number,
   resolution: number,
   scale: number,
+  textures: RasterTextures,
 ): MaskLayerState {
   const maskCmds = toMaskCommands(commands);
   const { content, clip } = splitAtDestinationIn(maskCmds);
   const hasClip = clip.length > 0;
 
   const scene = new Container();
-  executeCommandsPixi(scene, content, scale);
+  executeCommandsPixi(scene, content, scale, textures);
 
   const renderTexture = RenderTexture.create({ width, height, resolution });
   const sprite = new Sprite(renderTexture);
@@ -243,7 +253,7 @@ function buildMaskLayerState(
 
   if (hasClip) {
     clipScene = new Container();
-    executeCommandsPixi(clipScene, clip, scale);
+    executeCommandsPixi(clipScene, clip, scale, textures);
     clipTexture = RenderTexture.create({ width, height, resolution });
     clipSprite = new Sprite(clipTexture);
     sprite.mask = clipSprite;
@@ -276,34 +286,20 @@ function buildCustomLayerState(
   return { kind: "custom", canvas, sprite, render };
 }
 
-/**
- * Destroy a RenderTexture without letting its death notify shared PixiJS state.
- *
- * See Note [Viewer teardown is page-local].
- */
-function destroyRenderTexture(texture: RenderTexture): void {
-  const source = texture.source;
-  source.style?.removeAllListeners();
-  source.removeAllListeners();
-  texture.destroy(true);
-}
-
-function destroyLayerState(state: LayerState, destroyTextures = false): void {
+// Rebuilds and teardown both free the GPU textures, quietly as a mask
+// clipTexture may be bound in a shared BindGroup.
+// See Note [Viewer teardown is page-local].
+function destroyLayerState(state: LayerState): void {
   if (state.kind === "command") {
     state.scene.destroy({ children: true });
-    if (destroyTextures) destroyRenderTexture(state.renderTexture);
-    else state.renderTexture.destroy(false);
+    destroyTextureQuietly(state.renderTexture);
     state.sprite.destroy();
   } else if (state.kind === "mask") {
     state.scene.destroy({ children: true });
-    if (destroyTextures) destroyRenderTexture(state.renderTexture);
-    else state.renderTexture.destroy(false);
+    destroyTextureQuietly(state.renderTexture);
     state.sprite.destroy();
     if (state.clipScene) state.clipScene.destroy({ children: true });
-    if (state.clipTexture) {
-      if (destroyTextures) destroyRenderTexture(state.clipTexture);
-      else state.clipTexture.destroy(false);
-    }
+    if (state.clipTexture) destroyTextureQuietly(state.clipTexture);
     if (state.clipSprite) state.clipSprite.destroy();
   } else {
     state.sprite.destroy();
@@ -385,6 +381,21 @@ export async function createPixiViewer(
 
   // Layer state
   let layerStates: LayerState[] = [];
+  let destroyed = false;
+
+  // Owned here, not by layer state: rebuilds on resize or setLayers reuse them.
+  // A scene built before its bitmap decoded skipped the IM, so rebuild then.
+  let rebuildQueued = false;
+  const rasterTextures = createRasterTextures(() => {
+    if (rebuildQueued || destroyed) return;
+    rebuildQueued = true;
+    requestAnimationFrame(() => {
+      rebuildQueued = false;
+      if (destroyed) return;
+      rebuildLayers();
+      renderFull();
+    });
+  });
 
   function fitToViewport(): void {
     const cw = container.clientWidth;
@@ -419,16 +430,24 @@ export async function createPixiViewer(
           ch,
           pr,
           scale,
+          rasterTextures,
         );
       } else if (isCustomLayer(layer)) {
         return buildCustomLayerState(app, layer.render, cw, ch);
       } else {
-        return buildCommandLayerState(app, layer.commands, cw, ch, pr, scale);
+        return buildCommandLayerState(
+          app,
+          layer.commands,
+          cw,
+          ch,
+          pr,
+          scale,
+          rasterTextures,
+        );
       }
     });
+    rasterTextures.sweep();
   }
-
-  let destroyed = false;
 
   /** Render all layer scenes to their RenderTextures at the current transform. */
   function renderFull(): void {
@@ -558,6 +577,10 @@ export async function createPixiViewer(
     renderFull();
   }
 
+  // Decode before the first build so IM content does not pop in late. Held
+  // for the current layers so a setLayers back to them skips the decode.
+  let heldRasters = await preparePixiRasters(layers);
+
   // Attach event listeners
   container.addEventListener("wheel", onWheel, { passive: false });
   container.addEventListener("mousedown", onMouseDown);
@@ -585,9 +608,11 @@ export async function createPixiViewer(
       window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("resize", onResize);
       for (const ls of layerStates) {
-        destroyLayerState(ls, true);
+        destroyLayerState(ls);
       }
       layerStates = [];
+      rasterTextures.destroy();
+      heldRasters.release();
       // Remove the canvas, but do NOT pass `true` / `releaseGlobalResources`.
       // That flag makes PixiJS run GlobalResourceRegistry.release(), which
       // clears the PAGE-GLOBAL TexturePool and destroys every pooled texture —
@@ -613,10 +638,15 @@ export async function createPixiViewer(
           // Custom layers: render callback may have changed, no rebuild needed
           return false;
         });
+      const previous = sameLayerCommands(layers, newLayers)
+        ? undefined
+        : heldRasters;
       layers = newLayers;
+      if (previous) heldRasters = retainRasters(layers, true);
       if (needsRebuild) {
         rebuildLayers();
       }
+      previous?.release();
       renderFull();
     },
 
@@ -659,7 +689,10 @@ export async function createPixiViewer(
 // A BindGroup permanently nulls its own `resources` when a bound resource is
 // destroyed (BindGroup.onResourceChange -> destroy), and nothing ever repairs
 // it -- so poisoning a *shared* BindGroup breaks every viewer that later
-// borrows it. Our layer RenderTextures are private to this viewer and are
-// about to go away, so we drop their listeners before destroying them: the
-// "change" event that would poison a shared BindGroup is simply never
-// delivered. GPU memory is still freed.
+// borrows it. Our layer RenderTextures and IM textures are private to this
+// viewer and are about to go away, so we unload them first, while the source
+// is not yet destroyed and "change" only dirties a BindGroup, then drop their
+// "change" listeners (and their style's) before destroying them: the "change"
+// that would poison a shared BindGroup is never delivered. "destroy" still
+// fires, so the renderer frees a render texture's framebuffer. Layer textures
+// are freed this way on every rebuild, not only at teardown.

@@ -1,5 +1,7 @@
 import type { BBox, CanvasCommand } from "./types.js";
 import { executeCommands } from "./renderer.js";
+import { retainRasters, sameLayerCommands } from "./raster.js";
+import type { RasterCache } from "./raster.js";
 
 /** A layer with pre-colored canvas commands rendered as-is */
 export interface CommandLayer {
@@ -112,6 +114,12 @@ export interface ViewerOptions {
 
   /** Mirror the image vertically (flip top/bottom). Default: false. */
   mirrorV?: boolean;
+
+  /**
+   * Bitmaps from {@link prepareRasters}. IM commands not prepared are decoded
+   * lazily and appear on a later frame.
+   */
+  rasters?: RasterCache;
 }
 
 /** Handle returned by createViewer for controlling the viewer */
@@ -180,6 +188,20 @@ export function createViewer(options: ViewerOptions): Viewer {
   const mirrorV = options.mirrorV ?? false;
 
   let layers: ViewerLayer[] = options.layers ?? [];
+  const rasters = options.rasters;
+  // Held for the current layers, so their bitmaps close when replaced.
+  let heldRasters = retainRasters(layers);
+  let destroyed = false;
+  let rerenderQueued = false;
+
+  function onRasterReady(): void {
+    if (rerenderQueued || destroyed) return;
+    rerenderQueued = true;
+    requestAnimationFrame(() => {
+      rerenderQueued = false;
+      if (!destroyed) render();
+    });
+  }
 
   // Apply background
   if (options.background !== null) {
@@ -269,7 +291,11 @@ export function createViewer(options: ViewerOptions): Viewer {
       const sy = mirrorV ? scale : -scale;
       ctx.transform(sx, 0, 0, sy, tx, ty);
       if (hasCommands(layer)) {
-        executeCommands(ctx, layer.commands, scale);
+        executeCommands(ctx, layer.commands, scale, {
+          rasters,
+          onRasterReady,
+          mask: isMaskLayer(layer),
+        });
       } else {
         layer.render(ctx, scale);
       }
@@ -344,6 +370,8 @@ export function createViewer(options: ViewerOptions): Viewer {
     fitToViewport,
 
     destroy(): void {
+      destroyed = true;
+      heldRasters.release();
       container.removeEventListener("wheel", onWheel);
       container.removeEventListener("mousedown", onMouseDown);
       window.removeEventListener("mousemove", onMouseMove);
@@ -356,6 +384,12 @@ export function createViewer(options: ViewerOptions): Viewer {
     },
 
     setLayers(newLayers: ViewerLayer[]): void {
+      // Rescanning every command on a visibility or colour change is costly.
+      if (!sameLayerCommands(layers, newLayers)) {
+        const previous = heldRasters;
+        heldRasters = retainRasters(newLayers);
+        previous.release();
+      }
       layers = newLayers;
       render();
     },

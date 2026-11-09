@@ -615,6 +615,7 @@ recolorCommands (cr, cg, cb, ca) = map rc
     rc (CmdStroke _ _ _ _ lw) = CmdStroke cr cg cb ca lw
     rc CmdSetFillColor{} = CmdSetFillColor cr cg cb ca
     rc (CmdSetStrokeColor _ _ _ _ lw) = CmdSetStrokeColor cr cg cb ca lw
+    rc (CmdImageMask _ _ _ _ x0 y0 x1 y1 png) = CmdImageMask cr cg cb ca x0 y0 x1 y1 png
     rc cmd = cmd
 
 {- | Create a synthetic outline 'CanvasDiagram' from the union bounding box
@@ -778,12 +779,16 @@ extractGroup depth acc (cmd : rest) =
 isClearColour :: CanvasCmd -> Bool
 isClearColour (CmdFill r g b _a) = isWhite r g b
 isClearColour (CmdStroke r g b _a _lw) = isWhite r g b
+isClearColour (CmdImageMask r g b _a _ _ _ _ _) = isWhite r g b
 isClearColour _ = False
 
 -- | Check if a command uses the dark colour (black: ~0, ~0, ~0).
 isDarkColour :: CanvasCmd -> Bool
 isDarkColour (CmdFill r g b _a) = isBlack r g b
 isDarkColour (CmdStroke r g b _a _lw) = isBlack r g b
+-- A raster is a fill of its set pixels, so it must classify like one or
+-- inverted mode drops the group and the punch loses every hole.
+isDarkColour (CmdImageMask r g b _a _ _ _ _ _) = isBlack r g b
 isDarkColour _ = False
 
 isWhite :: Double -> Double -> Double -> Bool

@@ -27,16 +27,22 @@ module Diagrams.Backend.CanvasJson.Cairo (
     renderLayeredDiagramTo,
 
     -- * Low level
+    MaskSurfaces,
+    withMaskSurfaces,
+    runCommands,
     executeCommands,
 ) where
 
 import Codec.Picture qualified as JP
 import Codec.Picture.Types qualified as JPT
+import Control.Exception (throwIO)
+import Control.Monad.IO.Class (liftIO)
 import Control.Monad.State.Strict (StateT, execStateT, get, gets, lift, modify, put)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Char (toLower)
 import Data.Foldable (for_)
+import Data.Map.Strict qualified as Map
 import Data.Word (Word8)
 import Diagrams.Backend.CanvasJson (
     BBox (..),
@@ -45,8 +51,12 @@ import Diagrams.Backend.CanvasJson (
     CompositeOp (..),
     LayeredDiagram (..),
     MaskLayer (..),
+    MaskPng,
+    maskPngHeight,
+    maskPngWidth,
     punchedLayers,
  )
+import Diagrams.Backend.CanvasJson.MaskPng (MaskDecodeError (..), withMaskSurface)
 import GI.Cairo.Render qualified as C
 import GI.Cairo.Render.Matrix (Matrix (..))
 import System.FilePath (takeExtension)
@@ -126,18 +136,15 @@ formatFromExtension path = case map toLower (takeExtension path) of
 -- | Render a single-layer 'CanvasDiagram' to an image.
 renderCanvasDiagramTo :: ImageFormat -> FilePath -> ImageOptions -> CanvasDiagram -> IO ()
 renderCanvasDiagramTo fmt path opts cd =
-    withSurface fmt path opts $ \surf -> C.renderWith surf $ do
-        drawBackground opts
-        let bounds = cdBounds cd
-            scale = fitScale opts bounds
-        C.save
-        applyFitTransform opts bounds
-        finalStack <-
-            execStateT
-                (executeCommands scale (cdCommands cd))
-                [initialDrawState]
-        -- Restore our save + any unmatched saves left by the command stream.
-        for_ [1 .. length finalStack] $ const C.restore
+    withMaskSurfaces (cdCommands cd) $ \masks ->
+        withSurface fmt path opts $ \surf -> C.renderWith surf $ do
+            drawBackground opts
+            let bounds = cdBounds cd
+                scale = fitScale opts bounds
+            C.save
+            applyFitTransform opts bounds
+            runCommands masks scale (cdCommands cd)
+            C.restore
 
 {- | Render a 'LayeredDiagram' — each layer is drawn in isolation (so its
 @destination-out@\/@destination-in@ commands only affect that layer's
@@ -147,27 +154,27 @@ semantics pixel-for-pixel.
 -}
 renderLayeredDiagramTo :: ImageFormat -> FilePath -> ImageOptions -> LayeredDiagram -> IO ()
 renderLayeredDiagramTo fmt path opts mld =
-    withSurface fmt path opts $ \surf -> C.renderWith surf $ do
-        drawBackground opts
-        let bounds = ldBounds mld
-            scale = fitScale opts bounds
-        for_ (punchedLayers mld) $ \layer -> do
-            C.pushGroup
-            C.save
-            applyFitTransform opts bounds
-            finalStack <-
-                execStateT
-                    (executeCommands scale (mlCommands layer))
-                    [initialDrawState]
-            -- Restore our save + any unmatched saves left by the command stream
-            -- so the cairo state is back at the pushGroup level.
-            for_ [1 .. length finalStack] $ const C.restore
-            tintLayer opts (mlColor layer)
-            C.popGroupToSource
-            C.save
-            C.setOperator C.OperatorOver
-            C.paint
-            C.restore
+    -- The punch is drawn into every layer, so its rasters are decoded once;
+    -- a layer's own are decoded only while it draws, bounding the peak.
+    withMaskSurfaces (ldPunch mld) $ \punchMasks ->
+        withSurface fmt path opts $ \surf -> do
+            C.renderWith surf (drawBackground opts)
+            let bounds = ldBounds mld
+                scale = fitScale opts bounds
+            for_ (punchedLayers mld) $ \layer ->
+                extendMaskSurfaces punchMasks (mlCommands layer) $ \masks ->
+                    C.renderWith surf $ do
+                        C.pushGroup
+                        C.save
+                        applyFitTransform opts bounds
+                        runCommands masks scale (mlCommands layer)
+                        C.restore
+                        tintLayer opts (mlColor layer)
+                        C.popGroupToSource
+                        C.save
+                        C.setOperator C.OperatorOver
+                        C.paint
+                        C.restore
 
 --------------------------------------------------------------------------------
 -- Surface setup
@@ -309,15 +316,44 @@ updateHead f = modify $ \case
     (s : ss) -> f s : ss
     [] -> [f initialDrawState]
 
+-- | Decoded @IM@ rasters, keyed by payload.
+type MaskSurfaces = Map.Map MaskPng C.Surface
+
+{- | Decode every distinct @IM@ payload in the commands for the duration of
+the action. Throws 'MaskDecodeError' for a payload outside the profile, as
+drawing the board without it would be wrong.
+-}
+withMaskSurfaces :: [CanvasCmd] -> (MaskSurfaces -> IO a) -> IO a
+withMaskSurfaces = extendMaskSurfaces Map.empty
+
+-- | 'withMaskSurfaces' reusing the payloads already decoded.
+extendMaskSurfaces :: MaskSurfaces -> [CanvasCmd] -> (MaskSurfaces -> IO a) -> IO a
+extendMaskSurfaces decoded cmds act = go (Map.keys pngs) decoded
+  where
+    pngs = Map.fromList [(png, ()) | CmdImageMask _ _ _ _ _ _ _ _ png <- cmds, Map.notMember png decoded]
+    go [] acc = act acc
+    go (png : rest) acc = do
+        r <- withMaskSurface png $ \surf -> go rest (Map.insert png surf acc)
+        either (throwIO . MaskDecodeError) pure r
+
+{- | Run a command stream from a fresh drawing state, then restore any saves
+it left unmatched.
+-}
+runCommands :: MaskSurfaces -> Double -> [CanvasCmd] -> C.Render ()
+runCommands masks scale cmds = do
+    finalStack <- execStateT (executeCommands masks scale cmds) [initialDrawState]
+    for_ [2 .. length finalStack] $ const C.restore
+
 {- | Interpret a command stream onto the cairo context. The @scale@ is the
 current view scale and is used to divide the values of the view-relative
-line width and dash commands (@KV@, @KSV@, @LDV@).
+line width and dash commands (@KV@, @KSV@, @LDV@). Every @IM@ payload must
+be in the 'MaskSurfaces'.
 -}
-executeCommands :: Double -> [CanvasCmd] -> Interp ()
-executeCommands scale = mapM_ (executeCmd scale)
+executeCommands :: MaskSurfaces -> Double -> [CanvasCmd] -> Interp ()
+executeCommands masks scale = mapM_ (executeCmd masks scale)
 
-executeCmd :: Double -> CanvasCmd -> Interp ()
-executeCmd scale = \case
+executeCmd :: MaskSurfaces -> Double -> CanvasCmd -> Interp ()
+executeCmd masks scale = \case
     CmdSave -> do
         lift C.save
         st <- get
@@ -411,6 +447,24 @@ executeCmd scale = \case
         SourceOver -> C.setOperator C.OperatorOver
         DestinationOut -> C.setOperator C.OperatorDestOut
         DestinationIn -> C.setOperator C.OperatorDestIn
+    CmdImageMask r g b a x0 y0 x1 y1 png -> case Map.lookup png masks of
+        Nothing -> liftIO (throwIO (MaskDecodeError "IM payload was not decoded before the render"))
+        Just surf -> lift $ do
+            let p = (x1 - x0) / fromIntegral (maskPngWidth png)
+            C.save
+            Matrix xx yx xy yy _ _ <- C.getMatrix
+            -- Device pixels per raster pixel: crisp squares when magnified,
+            -- filtered when minified so sub-pixel holes still show.
+            let k = sqrt (abs (xx * yy - xy * yx)) * p
+            setSourceRGBA255 r g b a
+            -- Row 0 is at y1; the negative scale undoes the view's Y flip.
+            C.translate x0 y1
+            C.scale p (negate ((y1 - y0) / fromIntegral (maskPngHeight png)))
+            -- The operator is left as set by GCO, so destination-out punches.
+            C.withPatternForSurface surf $ \pat -> do
+                C.patternSetFilter pat (if k > 1 then C.FilterNearest else C.FilterGood)
+                C.mask pat
+            C.restore
 
 setSourceRGBA255 :: Double -> Double -> Double -> Double -> C.Render ()
 setSourceRGBA255 r g b a = C.setSourceRGBA (r / 255) (g / 255) (b / 255) a

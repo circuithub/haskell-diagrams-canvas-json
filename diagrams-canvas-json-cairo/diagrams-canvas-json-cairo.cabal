@@ -20,15 +20,23 @@ common warnings
 
 library
   import:           warnings
-  exposed-modules:  Diagrams.Backend.CanvasJson.Cairo
+  exposed-modules:
+    Diagrams.Backend.CanvasJson.Cairo
+    Diagrams.Backend.CanvasJson.MaskPng
+    Diagrams.Backend.CanvasJson.MaskRaster
+
   build-depends:
+    , array
     , base                  >=4.20 && <4.22
     , bytestring
+    , containers
     , diagrams-canvas-json
     , filepath
     , gi-cairo-render
     , JuicyPixels
     , mtl
+    , text
+    , zlib                  >=0.7  && <0.8
 
   hs-source-dirs:   src
   default-language: GHC2021
@@ -45,4 +53,24 @@ executable diagrams-canvas-json-cairo
     , optparse-applicative
 
   hs-source-dirs:   exe
+  default-language: GHC2021
+
+test-suite diagrams-canvas-json-cairo-test
+  import:           warnings
+  type:             exitcode-stdio-1.0
+  main-is:          Main.hs
+  build-depends:
+    , aeson
+    , base                        >=4.20 && <4.22
+    , bytestring
+    , containers
+    , diagrams-canvas-json
+    , diagrams-canvas-json-cairo
+    , directory
+    , gi-cairo-render
+    , JuicyPixels
+    , tasty
+    , tasty-hunit
+
+  hs-source-dirs:   test
   default-language: GHC2021

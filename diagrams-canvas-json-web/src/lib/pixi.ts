@@ -5,7 +5,13 @@
  * Requires pixi.js as a dependency.
  */
 
-export type { CanvasDiagram, CanvasCommand, Color, BBox } from "./types.js";
+export type {
+  CanvasDiagram,
+  CanvasCommand,
+  Color,
+  BBox,
+  ImageMaskCommand,
+} from "./types.js";
 export {
   isCommandLayer,
   isCustomLayer,
@@ -26,6 +32,12 @@ export {
   createPixiApp,
   toMaskCommands,
 } from "./renderer-pixi.js";
-export type { RenderPixiOptions } from "./renderer-pixi.js";
+export type { RenderPixiOptions, RasterTextures } from "./renderer-pixi.js";
+export { createRasterTextures } from "./renderer-pixi.js";
+export {
+  drawImageMask,
+  preparePixiRasters as prepareRasters,
+} from "./raster.js";
+export type { RasterCache, RasterSource } from "./raster.js";
 export { createPixiViewer } from "./viewer-pixi.js";
 export type { PixiViewer, PixiViewerOptions } from "./viewer-pixi.js";
