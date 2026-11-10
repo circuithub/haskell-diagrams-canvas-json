@@ -21,7 +21,7 @@ main =
     defaultMain $
         testGroup
             "diagrams-canvas-json"
-            [maskPngTests, imageMaskJsonTests, imageMaskValidationTests, optimizeTests]
+            [maskPngTests, imageMaskJsonTests, imageMaskValidationTests, optimizeTests, encodingTests]
 
 -- Profile fields of a fixture PNG; CRCs are zero as the core does not check them.
 data Fixture = Fixture
@@ -189,4 +189,57 @@ optimizeTests =
                 @?= [CmdSave, CmdSetGlobalCompositeOperation DestinationOut, goodCmd, goodCmd, CmdRestore]
         , testCase "drops a transparent IM" $
             optimizeCommands [CmdImageMask 0 0 0 0.0005 0 0 0.2 0.1 goodPng, goodCmd] @?= [goodCmd]
+        ]
+
+-- The viewers read the bytes, so the direct encoding must write those of the 'A.Value'.
+encodingTests :: TestTree
+encodingTests =
+    testGroup
+        "direct encoding"
+        [ testCase "a diagram writes the bytes of its value" $
+            A.encode diagram @?= A.encode (A.toJSON diagram)
+        , testCase "a layered diagram writes the bytes of its value" $
+            A.encode layered @?= A.encode (A.toJSON layered)
+        , testCase "a layered diagram without a punch writes the bytes of its value" $
+            A.encode layered{ldPunch = []} @?= A.encode (A.toJSON layered{ldPunch = []})
+        ]
+  where
+    precision = defaultJsonPrecision{jpCoordinates = 6, jpDimensions = 6}
+    diagram = CanvasDiagram 400 400 (BBox (-1.25) 0.5 3.125 4.0000004) everyCommand precision
+    layered =
+        LayeredDiagram
+            { ldWidth = 4.375
+            , ldHeight = 3.5
+            , ldBounds = BBox 0 0 4.375 3.5
+            , ldLayers = [MaskLayer (Just "copper") (218, 165, 32, 0.8) everyCommand, MaskLayer Nothing (0, 0, 0, 1) [CmdFillCurrent]]
+            , ldPunch = [CmdSave, CmdSetGlobalCompositeOperation DestinationOut, goodCmd, CmdRestore]
+            , ldPrecision = precision
+            }
+    everyCommand =
+        [ CmdSave
+        , CmdRestore
+        , CmdTransform 1 0 0 (-1) 0.123456789 2
+        , CmdBeginPath
+        , CmdMoveTo 1.0000005 (-2.5)
+        , CmdLineTo 3 4
+        , CmdBezierTo 1 2 3 4 5 6
+        , CmdQuadTo 1 2 3 4
+        , CmdArc 1 2 0.5 0 (2 * pi)
+        , CmdClosePath
+        , CmdFill 0 0 0 1
+        , CmdStroke 255 255 255 0.5 0.1
+        , CmdStrokeView 1 2 3 0.25 2
+        , CmdSetFillColor 10 20 30 1
+        , CmdSetStrokeColor 10 20 30 1 0.2
+        , CmdSetStrokeColorView 10 20 30 1 0.2
+        , CmdFillCurrent
+        , CmdStrokeCurrent
+        , CmdSetLineCap 1
+        , CmdSetLineJoin 2
+        , CmdSetLineDash [0.1, 0.2]
+        , CmdSetLineDashView [1, 2]
+        , CmdFillText "R1 \"x\"" 1 2
+        , CmdSetFont "16px sans-serif"
+        , CmdSetGlobalCompositeOperation DestinationIn
+        , goodCmd
         ]

@@ -17,7 +17,10 @@ common warnings
 
 library
   import:           warnings
-  exposed-modules:  Gerber.Diagrams.CanvasJson
+  exposed-modules:
+    Gerber.CanvasJson.Layer
+    Gerber.Diagrams.CanvasJson
+
   build-depends:
     , aeson
     , base                  >=4.20 && <4.22
@@ -27,7 +30,10 @@ library
     , foldl
     , gerber
     , gerber-diagrams
+    , linear
+    , megaparsec
     , text
+    , vector
 
   hs-source-dirs:   src
   default-language: GHC2021
@@ -59,6 +65,12 @@ test-suite gerber-diagrams-canvas-json-test
     , base                         >=4.20 && <4.22
     , bytestring
     , diagrams-canvas-json
+    , diagrams-canvas-json-cairo
+    , filepath
     , gerber-diagrams-canvas-json
+    , JuicyPixels
+    , temporary
+    , text
+    , vector
     , tasty
     , tasty-hunit

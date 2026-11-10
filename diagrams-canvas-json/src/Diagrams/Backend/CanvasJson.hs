@@ -17,6 +17,7 @@ module Diagrams.Backend.CanvasJson (
 
     -- * Rendering
     renderCanvasJson,
+    sizeFromSpec,
     CanvasJsonOptions (..),
     canvasJsonOptions,
 
@@ -26,6 +27,7 @@ module Diagrams.Backend.CanvasJson (
     roundN,
     encodeCmd,
     encodeBBox,
+    encodingCmd,
 
     -- * Canvas commands
     CanvasCmd (..),
@@ -59,6 +61,7 @@ import Control.Monad (unless, when)
 import Control.Monad.State.Strict
 import Data.Aeson (FromJSON (..), ToJSON (..))
 import Data.Aeson qualified as A
+import Data.Aeson.Encoding qualified as E
 import Data.Aeson.Types qualified as A
 import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString qualified as BS
@@ -124,6 +127,13 @@ using 'Data.Scientific.Scientific' to avoid IEEE 754 representation artifacts.
 -}
 roundN :: Int -> Double -> A.Value
 roundN dp x = A.Number $ scientific sig (negate dp)
+  where
+    factor = (10 :: Integer) ^ dp
+    sig = round (x * fromIntegral factor)
+
+-- | 'roundN' written straight to an 'E.Encoding', with the same digits.
+roundE :: Int -> Double -> E.Encoding
+roundE dp x = E.scientific $ scientific sig (negate dp)
   where
     factor = (10 :: Integer) ^ dp
     sig = round (x * fromIntegral factor)
@@ -375,9 +385,53 @@ encodeCmd jp cmd = case cmd of
     da = roundN (jpDash jp)
     ang = roundN (jpAngles jp)
 
+{- | 'encodeCmd' written straight to an 'E.Encoding'. A large diagram has
+millions of commands, and building their 'A.Value's first holds them all.
+-}
+encodingCmd :: JsonPrecision -> CanvasCmd -> E.Encoding
+encodingCmd jp cmd = case cmd of
+    CmdSave -> tag "S" []
+    CmdRestore -> tag "R" []
+    CmdTransform a b c d e f -> tag "T" [t a, t b, t c, t d, t e, t f]
+    CmdBeginPath -> tag "B" []
+    CmdMoveTo x y -> tag "M" [co x, co y]
+    CmdLineTo x y -> tag "L" [co x, co y]
+    CmdBezierTo x1 y1 x2 y2 x y -> tag "C" [co x1, co y1, co x2, co y2, co x, co y]
+    CmdQuadTo x1 y1 x y -> tag "Q" [co x1, co y1, co x, co y]
+    CmdArc cx cy r startA endA -> tag "A" [co cx, co cy, co r, ang startA, ang endA]
+    CmdClosePath -> tag "Z" []
+    CmdFill r g b a -> tag "F" [col r, col g, col b, al a]
+    CmdStroke r g b a lineW -> tag "K" [col r, col g, col b, al a, lw' lineW]
+    CmdStrokeView r g b a lineW -> tag "KV" [col r, col g, col b, al a, lw' lineW]
+    CmdSetFillColor r g b a -> tag "FS" [col r, col g, col b, al a]
+    CmdSetStrokeColor r g b a lineW -> tag "KS" [col r, col g, col b, al a, lw' lineW]
+    CmdSetStrokeColorView r g b a lineW -> tag "KSV" [col r, col g, col b, al a, lw' lineW]
+    CmdFillCurrent -> tag "f" []
+    CmdStrokeCurrent -> tag "k" []
+    CmdSetLineCap c -> tag "LC" [E.int c]
+    CmdSetLineJoin j -> tag "LJ" [E.int j]
+    CmdSetLineDash ds -> tag "LD" (map da ds)
+    CmdSetLineDashView ds -> tag "LDV" (map da ds)
+    CmdFillText txt x y -> tag "FT" [E.string txt, co x, co y]
+    CmdSetFont f -> tag "SF" [E.string f]
+    CmdSetGlobalCompositeOperation gco -> tag "GCO" [E.string (compositeOpToText gco)]
+    CmdImageMask r g b a x0 y0 x1 y1 png ->
+        tag "IM" [col r, col g, col b, al a, imc x0, imc y0, imc x1, imc y1, E.text (maskPngBase64 png)]
+  where
+    tag name fields = E.list id (E.text name : fields)
+    imc = roundE (max imageMaskRectDecimals (jpCoordinates jp))
+    co = roundE (jpCoordinates jp)
+    col = roundE 0
+    al = roundE (jpAlpha jp)
+    t = roundE (jpTransform jp)
+    lw' = roundE (jpLineWidth jp)
+    da = roundE (jpDash jp)
+    ang = roundE (jpAngles jp)
+
 -- | Encode commands using 'defaultJsonPrecision'.
 instance ToJSON CanvasCmd where
     toJSON = encodeCmd defaultJsonPrecision
+    toEncoding = encodingCmd defaultJsonPrecision
 
 {- | Parse the compact array form emitted by 'encodeCmd'. Precision is lost
 on the round-trip (each field is a plain JSON number) but the command
@@ -476,9 +530,21 @@ encodeBBox jp bb =
   where
     dim = roundN (jpDimensions jp)
 
+-- | 'encodeBBox' written straight to an 'E.Encoding'; keys in the order 'A.object' sorts them.
+encodingBBox :: JsonPrecision -> BBox -> E.Encoding
+encodingBBox jp bb =
+    E.pairs $
+        E.pair "maxX" (dim (bbMaxX bb))
+            <> E.pair "maxY" (dim (bbMaxY bb))
+            <> E.pair "minX" (dim (bbMinX bb))
+            <> E.pair "minY" (dim (bbMinY bb))
+  where
+    dim = roundE (jpDimensions jp)
+
 -- | Encode using 'defaultJsonPrecision'.
 instance ToJSON BBox where
     toJSON = encodeBBox defaultJsonPrecision
+    toEncoding = encodingBBox defaultJsonPrecision
 
 instance FromJSON BBox where
     parseJSON = A.withObject "BBox" $ \o ->
@@ -508,6 +574,13 @@ instance ToJSON CanvasDiagram where
                 , "bounds" A..= encodeBBox jp (cdBounds cd)
                 , "commands" A..= map (encodeCmd jp) (cdCommands cd)
                 ]
+    -- Matched up front, so only the encoder holds the commands and they are freed as it writes them.
+    toEncoding (CanvasDiagram width height bounds commands jp) =
+        E.pairs $
+            E.pair "bounds" (encodingBBox jp bounds)
+                <> E.pair "commands" (E.list (encodingCmd jp) commands)
+                <> E.pair "height" (roundE (jpDimensions jp) height)
+                <> E.pair "width" (roundE (jpDimensions jp) width)
 
 -- | Decoding loses the original precision; 'defaultJsonPrecision' is used.
 instance FromJSON CanvasDiagram where
@@ -553,9 +626,19 @@ encodeMaskLayer jp cl =
             Just n -> ["name" A..= n]
      in A.object (nameField ++ base)
 
+-- | 'encodeMaskLayer' written straight to an 'E.Encoding'.
+encodingMaskLayer :: JsonPrecision -> MaskLayer -> E.Encoding
+encodingMaskLayer jp cl =
+    let (r, g, b, a) = mlColor cl
+     in E.pairs $
+            E.pair "color" (E.list id [roundE 0 r, roundE 0 g, roundE 0 b, roundE (jpAlpha jp) a])
+                <> E.pair "commands" (E.list (encodingCmd jp) (mlCommands cl))
+                <> maybe mempty (E.pair "name" . E.text) (mlName cl)
+
 -- | Encode using 'defaultJsonPrecision'.
 instance ToJSON MaskLayer where
     toJSON = encodeMaskLayer defaultJsonPrecision
+    toEncoding = encodingMaskLayer defaultJsonPrecision
 
 instance FromJSON MaskLayer where
     parseJSON = A.withObject "MaskLayer" $ \o -> do
@@ -600,6 +683,13 @@ instance ToJSON LayeredDiagram where
                 , "layers" A..= map (encodeMaskLayer jp) (ldLayers mld)
                 ]
                     ++ ["punch" A..= map (encodeCmd jp) (ldPunch mld) | not (null (ldPunch mld))]
+    toEncoding (LayeredDiagram width height bounds layers punch jp) =
+        E.pairs $
+            E.pair "bounds" (encodingBBox jp bounds)
+                <> E.pair "height" (roundE (jpDimensions jp) height)
+                <> E.pair "layers" (E.list (encodingMaskLayer jp) layers)
+                <> (if null punch then mempty else E.pair "punch" (E.list (encodingCmd jp) punch))
+                <> E.pair "width" (roundE (jpDimensions jp) width)
 
 -- | Decoding loses the original precision; 'defaultJsonPrecision' is used.
 instance FromJSON LayeredDiagram where
